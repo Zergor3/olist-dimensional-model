@@ -10,3 +10,8 @@ dbt/olist_dw/logs/
 dbt/olist_dw/dbt_packages/
 
 dbt/olist_dw/.user.yml
+
+.venv-athena/
+dbt/olist_athena/target/
+dbt/olist_athena/logs/
+dbt/olist_athena/dbt_packages/

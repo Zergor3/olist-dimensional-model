@@ -1,0 +1,13 @@
+olist_athena:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      region_name: us-east-2            # region asignada a tu proyecto
+      database: awsdatacatalog
+      schema: olist_dbt                 # base de Glue donde dbt crea sus tablas
+      s3_staging_dir: "s3://{{ env_var('S3_BUCKET') }}/athena-results/"
+      s3_data_dir: "s3://{{ env_var('S3_BUCKET') }}/dbt/"
+      work_group: primary
+      aws_profile_name: de-journey      # el perfil de `aws login`
+      threads: 4

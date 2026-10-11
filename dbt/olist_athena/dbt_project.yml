@@ -1,0 +1,13 @@
+name: olist_athena
+version: "1.0.0"
+profile: olist_athena
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  olist_athena:
+    +materialized: table

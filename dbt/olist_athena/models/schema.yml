@@ -1,0 +1,114 @@
+version: 2
+
+models:
+  - name: dim_seller
+    description: "Una fila por vendedor (versión Athena sobre S3)."
+    columns:
+      - name: seller_key
+        description: "Clave sustituta."
+        data_tests:
+          - unique
+          - not_null
+      - name: seller_id
+        description: "Clave de negocio de Olist."
+        data_tests:
+          - unique
+          - not_null
+
+  - name: dim_product
+    description: "Una fila por producto, con categoria traducida al ingles."
+    columns:
+      - name: product_key
+        description: "Clave sustituta."
+        data_tests:
+          - unique
+          - not_null
+      - name: product_id
+        description: "Clave de negocio de Olist."
+        data_tests:
+          - unique
+          - not_null
+      - name: product_category_name_english
+        data_tests:
+          - not_null
+
+  - name: dim_customer
+    description: "Una fila por persona (customer_unique_id), ubicacion del pedido mas reciente (SCD tipo 1)."
+    columns:
+      - name: customer_key
+        description: "Clave sustituta."
+        data_tests:
+          - unique
+          - not_null
+      - name: customer_unique_id
+        description: "Clave de negocio: identifica a la persona."
+        data_tests:
+          - unique
+          - not_null
+
+  - name: dim_date
+    description: "Una fila por dia, 2016-2019. Dimension generada, sin fuente."
+    columns:
+      - name: date_key
+        description: "Clave en formato YYYYMMDD."
+        data_tests:
+          - unique
+          - not_null
+      - name: full_date
+        data_tests:
+          - unique
+          - not_null
+
+  - name: fact_order_items
+    description: "Grano: una fila por (order_id, order_item_id)."
+    columns:
+      - name: order_id
+        data_tests: [not_null]
+      - name: customer_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customer')
+                field: customer_key
+      - name: product_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: seller_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_seller')
+                field: seller_key
+      - name: purchase_date_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+
+  - name: fact_payments
+    description: "Grano: una fila por pago (order_id, payment_sequential)."
+    columns:
+      - name: order_id
+        data_tests: [not_null]
+      - name: customer_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_customer')
+                field: customer_key
+      - name: purchase_date_key
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
