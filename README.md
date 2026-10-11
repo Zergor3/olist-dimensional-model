@@ -1,6 +1,6 @@
 # Olist: modelo dimensional de e-commerce
 
-Proyecto de ingeniería de datos construido sobre el **Brazilian E-Commerce Public Dataset by Olist**. Los CSV se cargan primero tal como llegan a `staging`; después, estos scripts construyen un data warehouse analítico en el esquema `dw`. El flujo está orquestado con **Apache Airflow** sobre Docker, y el modelo dimensional también está implementado con **dbt** (modelos, tests y linaje).
+Proyecto de ingeniería de datos construido sobre el **Brazilian E-Commerce Public Dataset by Olist**. Los CSV se cargan primero tal como llegan a `staging`; después, estos scripts construyen un data warehouse analítico en el esquema `dw`. El flujo está orquestado con **Apache Airflow** sobre Docker, el modelo dimensional también está implementado con **dbt** (modelos, tests y linaje), y reconstruido en **AWS** como un data lake en Parquet (S3 + Athena + dbt-athena), orquestado desde Airflow.
 
 ## Contexto
 
@@ -82,15 +82,20 @@ Cómo levantarlo:
 mkdir dags, logs, config, plugins
 
 $key = python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
+$aws = ("$HOME/.aws").Replace('\','/')
 @"
 AIRFLOW_UID=50000
 FERNET_KEY=$key
+AWS_DIR=$aws
+S3_BUCKET=<tu-bucket>
 "@ | Set-Content .env
 
 docker compose build
 docker compose up airflow-init
 docker compose up -d
 ```
+
+`AWS_DIR` y `S3_BUCKET` solo se usan en los DAGs de AWS, pero el compose los lee al arrancar: la carpeta `~/.aws` debe existir (se crea con `aws login`). `.env` está en `.gitignore`; el repo incluye `.env.example` con los nombres de las variables.
 
 Abre `http://localhost:8080` (usuario y contraseña de desarrollo: `airflow` / `airflow`), activa `olist_pipeline` y lánzalo con **Trigger**.
 
@@ -201,17 +206,6 @@ CSV (Olist) ──► S3 raw/olist/<tabla>/ ──► Athena olist_raw (tablas e
 | Curated (prueba de concepto) | Athena `olist_curated` | Parquet + Snappy, tipado, `orders` particionada por mes | `src/ctas_parquet.py` |
 | Modelo dimensional | Athena `olist_dbt` | Parquet | `dbt build` en `dbt/olist_athena` |
 
-### Por qué Parquet: bytes escaneados
-
-Athena cobra por bytes escaneados. Con la misma consulta sobre CSV y sobre Parquet:
-
-| Consulta | Reducción de bytes escaneados |
-|---|---|
-| `SUM(price)` sobre order_items | ~50× menos |
-| `COUNT(DISTINCT customer_id)` de un mes (con partición) | ~72× menos |
-
-Parquet es columnar (lee solo las columnas que usa la consulta) y la partición por mes evita leer los demás meses.
-
 ### Reconciliación con el warehouse de Postgres
 
 Los resultados del modelo en Athena coinciden con el modelo en Postgres:
@@ -277,7 +271,47 @@ Las credenciales no están en el repo: `aws login` las guarda en `~/.aws`, y `pr
 ### Costos y limpieza
 
 - Cuenta con plan Free (créditos); Athena cobra por bytes escaneados (el dataset completo son ~120 MiB, así que cada consulta cuesta centavos o menos).
-- Todo es reproducible desde este repo. Para limpiar: borrar las bases `olist_raw`, `olist_curated` y `olist_dbt` en Athena/Glue y vaciar el bucket de S3.
+- Todo es reproducible desde este repo. Para limpiar, `python src/cleanup_aws.py` (simulación por defecto; `--execute` para borrar).
+
+## Orquestación en AWS con Airflow
+
+El DAG `olist_aws_pipeline` ejecuta de punta a punta el flujo del data lake: sube los CSV a S3, crea las tablas externas en Athena, construye el modelo dimensional con dbt-athena y valida las cifras.
+
+```
+upload_to_s3 ─► create_athena_tables ─► dbt_build ─► validate
+```
+
+| Tarea | Qué hace |
+|---|---|
+| `upload_to_s3` | Sube los 9 CSV a `s3://<bucket>/raw/olist/<tabla>/` y verifica el tamaño de cada objeto |
+| `create_athena_tables` | Crea la base `olist_raw` y una tabla externa por CSV (idempotente: `IF NOT EXISTS`) |
+| `dbt_build` | `dbt build` sobre `dbt/olist_athena`: 6 modelos y 33 tests, sin reintentos |
+| `validate` | Consulta Athena y compara con las cifras verificadas contra Postgres (112,650 filas con `SUM(price)` = 13,591,643.70; 103,886 pagos con suma 16,008,872.12) |
+
+### Credenciales
+
+El contenedor de Airflow no guarda claves de AWS. Se monta, desde la máquina local, solo lo necesario de `~/.aws`:
+
+- `config`, en solo lectura (perfil `de-journey`).
+- `login/`, con escritura: boto3 renueva ahí las credenciales temporales de `aws login`.
+
+La carpeta `credentials` (claves estáticas) no se monta. La ruta se define en `.env` (`AWS_DIR`) y el bucket en `S3_BUCKET`; ambos quedan fuera del repo, que solo incluye `.env.example`.
+
+Las credenciales de `aws login` caducan (12 h, renovables), por eso el DAG se dispara a mano (`schedule=None`). Si una tarea falla por credenciales expiradas:
+
+```powershell
+aws login --profile de-journey
+```
+
+y se usa **Clear** sobre la tarea fallida en la UI de Airflow.
+
+### Imagen de Docker
+
+dbt corre en un entorno virtual separado dentro de la imagen (`/opt/airflow/dbt_venv`) con `dbt-core`, `dbt-postgres` y `dbt-athena`. `dbt-athena` depende de `mmh3`, que se compila desde el código fuente, así que la imagen instala `gcc` y `g++`.
+
+### Limpieza de recursos
+
+`src/cleanup_aws.py` borra las bases de Athena/Glue y los objetos del bucket. Por defecto solo simula; para borrar de verdad hay que pasar `--execute` y escribir el nombre del bucket. Todo se reconstruye volviendo a disparar el DAG.
 
 ## Ejecución manual (sin Airflow)
 
@@ -352,7 +386,8 @@ Hallazgos principales:
 - `fact_payments` ya está modelada como fact separada. Una `fact_reviews` queda como trabajo futuro, con su propio grano para evitar fan-out.
 - En el pipeline del clima, los archivos crudos se nombran con la hora de ejecución y no con la fecha lógica del DAG, por lo que dos ejecuciones generan dos archivos. La vista `weather_hourly_latest` lo compensa; lo ideal es nombrarlos con `{{ ds }}`.
 - Las claves sustitutas de dbt se generan con `ROW_NUMBER()`, por lo que pueden cambiar si llegan filas nuevas; en producción convendría una clave estable derivada del id de negocio (por ejemplo, un hash).
-- El pipeline en AWS aún no está orquestado: las credenciales de `aws login` caducan, así que las tareas de Airflow que usen AWS dependerán de una sesión vigente.
+- `olist_aws_pipeline` se dispara a mano porque las credenciales de `aws login` caducan. En un entorno real el servicio usaría un rol de IAM asignado (sin `aws login`) y podría tener horario.
+- `dbt/olist_athena` tiene 33 tests frente a 36 en `dbt/olist_dw`: por ejemplo, el test singular de categorías sin traducir no se portó.
 - dbt construye en `dbt_dev` y el `dw` sigue construyéndose con scripts: ambos conviven para poder reconciliarlos. Siguiente ciclo: un perfil `prod` que apunte a `dw`, retirar el flujo con scripts SQL y añadir una `fact_reviews` con su propio grano.
 
 ## Estructura
@@ -361,6 +396,7 @@ Hallazgos principales:
 dags/
   olist_pipeline.py             # DAG: staging -> dw -> validaciones
   olist_dbt_pipeline.py         # DAG: staging -> dbt build
+  olist_aws_pipeline.py         # DAG: S3 -> Athena -> dbt-athena -> validación
   weather_pipeline.py           # DAG: API de clima -> staging
 sql/
   01_dw_ddl.sql                 # esquema, dimensiones y hechos
@@ -376,6 +412,7 @@ src/
   upload_olist_to_s3.py         # CSV -> S3 (capa raw)
   create_athena_tables.py       # tablas externas en Athena sobre raw
   ctas_parquet.py               # CTAS a Parquet (capa curated)
+  cleanup_aws.py                # limpia bases de Athena y objetos de S3 (simulación por defecto)
 docs/
   data-model.md                 # referencia del modelo y sus granos
 dbt/olist_dw/
@@ -384,8 +421,15 @@ dbt/olist_dw/
   tests/                        # tests singulares (categorías, grano)
   dbt_project.yml
   profiles.yml                  # conexión de desarrollo (esquema dbt_dev)
-docker-compose.yml              # warehouse + Airflow
-Dockerfile                      # imagen de Airflow con pandas y dbt (venv aparte)
+dbt/olist_athena/
+  models/                       # sources.yml, dimensiones, facts y schema.yml sobre Athena
+  macros/                       # date_key en sintaxis Trino
+  tests/                        # grano de ambas facts
+  dbt_project.yml
+  profiles.yml                  # conexión a Athena (perfil y bucket por variables de entorno)
+docker-compose.yml              # warehouse + Airflow (monta ~/.aws para los DAGs de AWS)
+Dockerfile                      # imagen de Airflow con pandas y dbt (postgres + athena, venv aparte)
+.env.example                    # nombres de las variables de entorno (sin valores)
 requirements.txt                # dependencias locales
 requirements-airflow.txt        # dependencias dentro de Airflow
 ```
