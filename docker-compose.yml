@@ -22,6 +22,9 @@ x-airflow-common:
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     # Tu warehouse: dentro de la red de Docker el host es "db", no "localhost"
+    AWS_PROFILE: de-journey
+    AWS_DEFAULT_REGION: us-east-2
+    S3_BUCKET: ${S3_BUCKET}
     DB_URL: postgresql+psycopg2://de:de@db:5432/warehouse
     DBT_HOST: db
     OLIST_DIR: /opt/airflow/data/olist
@@ -36,6 +39,7 @@ x-airflow-common:
     - ./sql:/opt/airflow/sql
     - ./data:/opt/airflow/data
     - ./dbt:/opt/airflow/dbt
+    - ${AWS_DIR}:/home/airflow/.aws
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on

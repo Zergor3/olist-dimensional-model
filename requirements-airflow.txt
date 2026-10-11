@@ -1,2 +1,4 @@
 pandas
 requests
+boto3
+botocore[crt]
