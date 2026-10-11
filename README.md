@@ -148,6 +148,137 @@ flowchart LR
 - `dbt_build` tiene `retries=0`: dbt termina con código distinto de cero si falla un modelo o un test, y la tarea queda en rojo.
 - Verificado: 6 modelos y 36 tests, `PASS=42 ERROR=0`.
 
+## Data lake en AWS (S3 + Athena)
+
+El mismo dataset se lleva a AWS como un data lake por capas, con una cuenta del plan gratuito de AWS (región asignada: `us-east-2`).
+
+```mermaid
+flowchart LR
+    A[CSV locales] -->|boto3| B["S3 raw/olist/"]
+    B -->|tablas externas| C["Athena olist_raw (string)"]
+    C -->|CTAS| D["S3 curated/olist/ (Parquet)"]
+    D --> E["Athena olist_curated (tipado)"]
+```
+
+| Script | Qué hace |
+|---|---|
+| `src/upload_olist_to_s3.py` | Sube los 9 CSV a `raw/olist/<tabla>/` y verifica el tamaño de cada objeto |
+| `src/create_athena_tables.py` | Crea la base `olist_raw` y una tabla externa por CSV (todo `string`, como la capa raw) |
+| `src/ctas_parquet.py` | `CREATE TABLE AS SELECT` a Parquet tipado: `order_items` sin particionar y `orders` particionada por mes |
+
+**CSV frente a Parquet** (mismos resultados, bytes escaneados por Athena):
+
+| Consulta | CSV | Parquet | Reducción |
+|---|---:|---:|---:|
+| Suma de `price` en `order_items` (112.650 filas; 13.591.643,70) | 15.438.671 | 307.076 | ~50× |
+| `COUNT(DISTINCT customer_id)` de pedidos de noviembre de 2017 (7.544) | 17.654.914 | 245.941 | ~72× |
+
+Parquet guarda los datos por columnas, así que una consulta lee solo las que usa, y la partición por mes permite saltarse las carpetas que no se filtran. Un `COUNT(*)` sobre una partición de Parquet escanea 0 bytes porque se resuelve con los metadatos del archivo; por eso la segunda comparación usa una columna real. La suma de `price` coincide con la del warehouse en Postgres.
+
+Notas de operación:
+
+- **Región asignada:** los proyectos del plan gratuito reciben una región según el país de contacto (para Perú, `us-east-2`). En `us-east-1` y `us-west-2` las políticas del proyecto bloquean crear recursos regionales, por ejemplo un bucket de S3.
+- **Credenciales temporales:** se obtienen con `aws login` y caducan; hay que iniciar sesión al empezar cada jornada. `boto3` necesita `botocore[crt]` para usarlas.
+- **Parquet y tipos:** la capa `curated` convierte las cadenas vacías en `NULL` (`TRY_CAST(NULLIF(col, ''))`) y usa `decimal(10,2)` para importes.
+
+## Modelo dimensional en AWS: dbt + Athena sobre S3/Parquet
+
+El mismo modelo estrella que corre en Postgres (`dbt/olist_dw`) está reconstruido sobre un data lake en AWS (`dbt/olist_athena`): los CSV viven en S3, Athena los consulta con SQL y dbt construye las dimensiones y los hechos como tablas Parquet.
+
+```
+CSV (Olist) ──► S3 raw/olist/<tabla>/ ──► Athena olist_raw (tablas externas, todo string)
+                                                   │
+                                                   ▼ dbt-athena (CTAS a Parquet)
+                                          olist_dbt: 5 dimensiones + 2 hechos
+```
+
+### Capas
+
+| Capa | Dónde | Formato | Cómo se crea |
+|---|---|---|---|
+| Raw | `s3://<bucket>/raw/olist/<tabla>/` | CSV | `src/upload_olist_to_s3.py` |
+| Tablas externas | Athena `olist_raw` | CSV (OpenCSVSerde, columnas string) | `src/create_athena_tables.py` |
+| Curated (prueba de concepto) | Athena `olist_curated` | Parquet + Snappy, tipado, `orders` particionada por mes | `src/ctas_parquet.py` |
+| Modelo dimensional | Athena `olist_dbt` | Parquet | `dbt build` en `dbt/olist_athena` |
+
+### Por qué Parquet: bytes escaneados
+
+Athena cobra por bytes escaneados. Con la misma consulta sobre CSV y sobre Parquet:
+
+| Consulta | Reducción de bytes escaneados |
+|---|---|
+| `SUM(price)` sobre order_items | ~50× menos |
+| `COUNT(DISTINCT customer_id)` de un mes (con partición) | ~72× menos |
+
+Parquet es columnar (lee solo las columnas que usa la consulta) y la partición por mes evita leer los demás meses.
+
+### Reconciliación con el warehouse de Postgres
+
+Los resultados del modelo en Athena coinciden con el modelo en Postgres:
+
+| Medida | Postgres (`dw`) | Athena (`olist_dbt`) |
+|---|---|---|
+| `dim_seller` | 3,095 | 3,095 |
+| `dim_product` | 32,951 | 32,951 |
+| `dim_customer` | 96,096 | 96,096 |
+| `dim_date` | 1,461 | 1,461 |
+| `fact_order_items` filas | 112,650 | 112,650 |
+| `SUM(price)` | 13,591,643.70 | 13,591,643.70 |
+| `fact_payments` filas | 103,886 | 103,886 |
+| `SUM(payment_value)` | 16,008,872.12 | 16,008,872.12 |
+
+`dim_product` además coincide en 74 categorías y peso total 75,007,492.
+
+`dbt build` ejecuta 6 modelos y 33 pruebas (unicidad, no nulos, integridad referencial hacia las dimensiones y grano de cada hecho): todas en `PASS`.
+
+### Diferencias entre Postgres y Athena (Trino)
+
+El SQL no es portable tal cual. Lo que hubo que cambiar:
+
+| Postgres | Athena (Trino) |
+|---|---|
+| `x::int`, `x::numeric(10,2)` | `CAST(x AS integer)`, `CAST(x AS decimal(10,2))` |
+| `generate_series(a, b, '1 day')` | `UNNEST(sequence(a, b, INTERVAL '1' DAY))` + `CAST(... AS date)` |
+| `to_char(d, 'YYYYMMDD')` | `date_format(d, '%Y%m%d')` |
+| `EXTRACT(isodow FROM d)` | `day_of_week(d)` |
+| `trim(to_char(d, 'Day'))` | `date_format(d, '%W')` |
+| `serial` (clave sustituta) | `ROW_NUMBER() OVER (ORDER BY clave_de_negocio)` |
+| campos vacíos = `NULL` | `OpenCSVSerde` devuelve `''`: `NULLIF(col, '')` antes de castear |
+
+Dos detalles que costaron un error:
+- `sequence()` con intervalos de días devuelve timestamps; sin el `CAST(... AS date)` el CTAS a Parquet falla por precisión.
+- Las tablas raw son todo `string` a propósito: la tipificación ocurre en los modelos de dbt, no al ingerir.
+
+### Cómo reproducirlo
+
+Requisitos: AWS CLI ≥ 2.32 (`aws login`), Python 3.12 (dbt-athena depende de paquetes sin wheel en 3.13 para Windows).
+
+```powershell
+python -m venv .venv-athena
+.\.venv-athena\Scripts\Activate.ps1
+pip install dbt-core dbt-athena boto3 "botocore[crt]"
+
+aws login --profile de-journey          # credenciales temporales (12 h)
+$env:S3_BUCKET = "<tu-bucket>"
+$env:AWS_PROFILE = "de-journey"
+
+python src/upload_olist_to_s3.py        # CSV -> S3
+python src/create_athena_tables.py      # tablas externas olist_raw
+python src/ctas_parquet.py              # (opcional) comparación CSV vs Parquet
+
+cd dbt\olist_athena
+$env:DBT_PROFILES_DIR = "."
+dbt debug
+dbt build
+```
+
+Las credenciales no están en el repo: `aws login` las guarda en `~/.aws`, y `profiles.yml` solo referencia el nombre del perfil y el bucket por variable de entorno.
+
+### Costos y limpieza
+
+- Cuenta con plan Free (créditos); Athena cobra por bytes escaneados (el dataset completo son ~120 MiB, así que cada consulta cuesta centavos o menos).
+- Todo es reproducible desde este repo. Para limpiar: borrar las bases `olist_raw`, `olist_curated` y `olist_dbt` en Athena/Glue y vaciar el bucket de S3.
+
 ## Ejecución manual (sin Airflow)
 
 Con los CSV de Olist en `data/olist/`:
@@ -221,6 +352,7 @@ Hallazgos principales:
 - `fact_payments` ya está modelada como fact separada. Una `fact_reviews` queda como trabajo futuro, con su propio grano para evitar fan-out.
 - En el pipeline del clima, los archivos crudos se nombran con la hora de ejecución y no con la fecha lógica del DAG, por lo que dos ejecuciones generan dos archivos. La vista `weather_hourly_latest` lo compensa; lo ideal es nombrarlos con `{{ ds }}`.
 - Las claves sustitutas de dbt se generan con `ROW_NUMBER()`, por lo que pueden cambiar si llegan filas nuevas; en producción convendría una clave estable derivada del id de negocio (por ejemplo, un hash).
+- El pipeline en AWS aún no está orquestado: las credenciales de `aws login` caducan, así que las tareas de Airflow que usen AWS dependerán de una sesión vigente.
 - dbt construye en `dbt_dev` y el `dw` sigue construyéndose con scripts: ambos conviven para poder reconciliarlos. Siguiente ciclo: un perfil `prod` que apunte a `dw`, retirar el flujo con scripts SQL y añadir una `fact_reviews` con su propio grano.
 
 ## Estructura
@@ -241,6 +373,9 @@ src/
   run_sql.py                    # ejecuta archivos .sql (usado por Airflow)
   extract_weather.py            # API de clima -> JSON crudo
   transform_load_weather.py     # JSON -> pandas -> staging
+  upload_olist_to_s3.py         # CSV -> S3 (capa raw)
+  create_athena_tables.py       # tablas externas en Athena sobre raw
+  ctas_parquet.py               # CTAS a Parquet (capa curated)
 docs/
   data-model.md                 # referencia del modelo y sus granos
 dbt/olist_dw/
