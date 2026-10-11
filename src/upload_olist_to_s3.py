@@ -1,13 +1,3 @@
-"""Sube los CSV de Olist a S3 (capa raw) y verifica los tamaños.
-
-Estructura en el bucket:  raw/olist/<tabla>/<archivo>.csv
-Es idempotente: volver a ejecutarlo sobrescribe las mismas claves.
-
-Uso (PowerShell):
-    $env:S3_BUCKET = "mi-bucket"
-    $env:AWS_PROFILE = "de-journey"
-    python src/upload_olist_to_s3.py
-"""
 import logging
 import os
 from pathlib import Path

@@ -1,8 +1,3 @@
-"""Ejecuta un archivo .sql contra el warehouse. Si algo falla, lanza excepcion.
-
-Equivale a: psql -v ON_ERROR_STOP=1 -f archivo.sql
-(el contenedor de Airflow no tiene psql, asi que se usa psycopg2).
-"""
 import logging
 import os
 from pathlib import Path
